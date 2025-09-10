@@ -112,8 +112,8 @@ PROVIDERS = {
     },
     "Google (Gemini)": {
         "runner": run_gemini,
-        "advanced": "gemini-2.5-pro",
-        "standard": "gemini-2.5-flash-lite",
+        "advanced": "gemini-1.5-pro",
+        "standard": "gemini-1.5-flash",
         "secret": "GEMINI_API_KEY",
     },
 }
