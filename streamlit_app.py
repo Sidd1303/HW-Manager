@@ -1,13 +1,25 @@
 import streamlit as st
-from importlib import import_module
 
-st.set_page_config(page_title="HW manager", page_icon="🧰", layout="centered")
-st.title("HW manager")
-st.caption("Select a homework page from the sidebar.")
+# Import homework pages
+import HWs.HW1 as HW1
+import HWs.HW2 as HW2
+import HWs.HW3 as HW3
 
-page = st.sidebar.radio("Pages", ["HW2 (URL Summarizer)", "HW1 (Document Q&A)"], index=0)
+st.set_page_config(page_title="HW Manager", page_icon="📚")
 
-if page.startswith("HW2"):
-    import_module("HWs.HW2").render()
-else:
-    import_module("HWs.HW1").render()
+st.title("📚 HW Manager")
+st.sidebar.title("Navigation")
+
+# Sidebar menu
+page = st.sidebar.radio(
+    "Choose Homework",
+    ("HW1 – Document Q&A", "HW2 – URL Summarizer", "HW3 – Chatbot with Memory"),
+)
+
+# Route to the right page
+if page.startswith("HW1"):
+    HW1.render()
+elif page.startswith("HW2"):
+    HW2.render()
+elif page.startswith("HW3"):
+    HW3.render()

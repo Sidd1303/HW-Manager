@@ -5,4 +5,8 @@ pypdf
 openai
 anthropic
 google-generativeai
-
+langchain
+# Provider integrations for LangChain
+langchain-openai
+langchain-anthropic
+langchain-google-genai

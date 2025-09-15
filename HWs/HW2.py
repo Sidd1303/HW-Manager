@@ -15,7 +15,7 @@ def read_url_content(url: str) -> str | None:
         response.raise_for_status()
         soup = BeautifulSoup(response.content, "html.parser")
 
-        # Remove script/style/noscript
+        # Remove script/style/noscript tags
         for tag in soup(["script", "style", "noscript"]):
             tag.decompose()
 
@@ -48,19 +48,49 @@ CONTENT START
 CONTENT END
 """
 
-# ------------------ Provider Runners ------------------
+# ------------------ Provider Runners (uniform signature) ------------------
 def run_openai(model: str, prompt: str, temperature: float, max_tokens: int):
     client = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY"))
     t0 = time.time()
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
+
+    kwargs = {
+        "model": model,
+        "messages": [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": prompt},
         ],
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+        "max_completion_tokens": max_tokens,
+    }
+    # 🚨 gpt-5 family doesn’t support temperature
+    if not model.startswith("gpt-5"):
+        kwargs["temperature"] = temperature
+
+    resp = client.chat.completions.create(**kwargs)
+    latency = time.time() - t0
+
+    # --- Safe extraction ---
+    choice = resp.choices[0].message
+    text = ""
+
+    # Standard field (works for gpt-4o, etc.)
+    if getattr(choice, "content", None):
+        text = choice.content
+
+    # Reasoning-style models (gpt-5 family)
+    elif hasattr(choice, "content") and isinstance(choice.content, list):
+        for block in choice.content:
+            if isinstance(block, dict) and block.get("type") == "output_text":
+                text += block.get("text", "")
+
+    if not text.strip():
+        text = "[No text returned by model]"
+
+    return text.strip(), latency
+
+    # gpt-5 / gpt-5-nano: do NOT pass temperature
+    # (If you later add a non-gpt-5 model that supports temp, you could add it conditionally.)
+
+    resp = client.chat.completions.create(**kwargs)
     latency = time.time() - t0
     text = resp.choices[0].message.content
     return text, latency
@@ -93,27 +123,40 @@ def run_gemini(model_name: str, prompt: str, temperature: float, max_tokens: int
         },
     )
     latency = time.time() - t0
-    text = getattr(resp, "text", "") or ""
-    return text, latency
+
+    # Safe parsing for Gemini (works for 1.5/2.5, parts-based responses, truncation, etc.)
+    text = ""
+    if hasattr(resp, "text") and resp.text:
+        text = resp.text
+    elif hasattr(resp, "candidates") and resp.candidates:
+        for cand in resp.candidates:
+            if getattr(cand, "content", None) and getattr(cand.content, "parts", None):
+                for part in cand.content.parts:
+                    if hasattr(part, "text") and part.text:
+                        text += part.text + "\n"
+    else:
+        text = "[No text returned from Gemini]"
+
+    return text.strip(), latency
 
 # ------------------ Provider Registry ------------------
 PROVIDERS = {
     "OpenAI": {
         "runner": run_openai,
-        "advanced": "gpt-4o",
-        "standard": "gpt-4o-mini",
+        "advanced": "gpt-5",                 # your chosen flagship
+        "standard": "gpt-5-nano",            # your chosen lite
         "secret": "OPENAI_API_KEY",
     },
     "Anthropic (Claude)": {
         "runner": run_anthropic,
-        "advanced": "claude-opus-4-1",
-        "standard": "claude-sonnet-4",
+        "advanced": "claude-opus-4-1",            # your chosen flagship
+        "standard": "claude-3-5-haiku-latest",    # your chosen lite
         "secret": "ANTHROPIC_API_KEY",
     },
     "Google (Gemini)": {
         "runner": run_gemini,
-        "advanced": "gemini-1.5-pro",
-        "standard": "gemini-1.5-flash",
+        "advanced": "gemini-2.5-pro",            # your chosen flagship
+        "standard": "gemini-2.5-flash-lite",     # your chosen lite
         "secret": "GEMINI_API_KEY",
     },
 }
@@ -140,7 +183,9 @@ def render():
         st.subheader("Model Settings")
         provider_name = st.selectbox("LLM Provider", list(PROVIDERS.keys()), index=0)
         use_advanced = st.checkbox("Use advanced model", value=True)
-        temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
+
+        # Temperature is meaningful for Anthropic/Gemini only (OpenAI gpt-5 family ignores it)
+        temperature = st.slider("Temperature (ignored for OpenAI gpt-5 family)", 0.0, 1.0, 0.2, 0.05)
         max_tokens = st.number_input("Max output tokens", min_value=128, max_value=4096, value=1000, step=64)
 
     col1, col2 = st.columns([1, 1])
