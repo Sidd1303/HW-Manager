@@ -5,9 +5,9 @@ import time
 
 # LangChain memory
 from langchain.memory import (
-    ConversationBufferMemory,
     ConversationSummaryMemory,
     ConversationTokenBufferMemory,
+    ConversationBufferWindowMemory,   # ✅ use windowed buffer
 )
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
@@ -84,7 +84,7 @@ def render():
     # ------------------ Persistent Memory ------------------
     if "memory" not in st.session_state or st.session_state.get("memory_type") != memory_type:
         if memory_type == "Buffer (6 exchanges)":
-            st.session_state.memory = ConversationBufferMemory(k=6, return_messages=True)
+            st.session_state.memory = ConversationBufferWindowMemory(k=6, return_messages=True)
         elif memory_type == "Summary memory":
             st.session_state.memory = ConversationSummaryMemory(llm=llm)
         else:
@@ -93,6 +93,10 @@ def render():
         st.session_state.chat_history = []  # reset history
 
     memory = st.session_state.memory
+
+    # ------------------ Debug Panel ------------------
+    with st.sidebar.expander("🔍 Debug: Memory Contents"):
+        st.write(memory.load_memory_variables({}))
 
     # ------------------ Display past chat history ------------------
     if st.session_state.get("chat_history"):
@@ -110,9 +114,9 @@ def render():
             docs.append(read_url(url2))
         context = "\n\n".join(docs)
 
-        # Load past memory
-        history = memory.load_memory_variables({})
-        prompt = f"Documents:\n{context}\n\nConversation:\n{history}\n\nUser: {question}\nAssistant:"
+        # Load past memory (✅ FIX: extract just "history")
+        history = memory.load_memory_variables({}).get("history", "")
+        prompt = f"Documents:\n{context}\n\nConversation so far:\n{history}\n\nUser: {question}\nAssistant:"
 
         # Display user message
         st.chat_message("user").write(question)
@@ -128,7 +132,7 @@ def render():
                     if hasattr(chunk, "content") and chunk.content:
                         response_text += chunk.content
                         placeholder.markdown(response_text)   # update gradually
-                        time.sleep(0.03)  # ⏳ typing effect (tweak speed if needed)
+                        time.sleep(0.03)  # ⏳ typing effect
 
                 # Save Q&A into memory
                 memory.save_context({"input": question}, {"output": response_text})
