@@ -24,6 +24,8 @@ langchain
 langchain-community
 langchain-openai
 langchain-anthropic
+langchain-google-genai
+
 
 # ======================
 # Vector DB (Chroma for HW4)
