@@ -1,12 +1,48 @@
+# ======================
+# Core app + UI
+# ======================
 streamlit
 requests
 beautifulsoup4
-pypdf
+
+# ======================
+# OpenAI + Models
+# ======================
 openai
+tiktoken
+
+# ======================
+# Anthropic + Google Gemini
+# ======================
 anthropic
 google-generativeai
+
+# ======================
+# LangChain for memory, chaining, etc.
+# ======================
 langchain
-# Provider integrations for LangChain
+langchain-community
 langchain-openai
 langchain-anthropic
-langchain-google-genai
+
+# ======================
+# Vector DB (Chroma for HW4)
+# ======================
+chromadb
+pysqlite3-binary
+
+# ======================
+# PDF parsing
+# ======================
+pypdf
+
+# ======================
+# Data utils
+# ======================
+
+
+# ======================
+# Misc fixes
+# ======================
+protobuf
+
