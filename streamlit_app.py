@@ -1,15 +1,12 @@
-# --- sqlite3 patch for ChromaDB (must run before anything else) ---
+# --- sqlite3 patch for Chroma in Codespaces/Cloud ---
 __import__("pysqlite3")
 import sys as _sys
 _sys.modules["sqlite3"] = _sys.modules.pop("pysqlite3")
 
 import streamlit as st
 
-# Import homework apps (each must expose render())
-import HWs.HW1 as HW1
-import HWs.HW2 as HW2
-import HWs.HW3 as HW3
-import HWs.HW4 as HW4
+# Import homework pages (each exposes render())
+from HWs import HW1, HW2, HW3, HW4, HW5
 
 st.sidebar.title("📚 Homework Selector")
 choice = st.sidebar.radio(
@@ -19,6 +16,7 @@ choice = st.sidebar.radio(
         "HW2 – Multi-Provider Q&A",
         "HW3 – Chatbot with Memory",
         "HW4 – Orgs RAG Chatbot",
+        "HW5 – Orgs RAG Chatbot (Chat + Evaluation)",  # 👈 new
     ],
 )
 
@@ -28,5 +26,7 @@ elif choice.startswith("HW2"):
     HW2.render()
 elif choice.startswith("HW3"):
     HW3.render()
-else:
+elif choice.startswith("HW4"):
     HW4.render()
+else:
+    HW5.render()
