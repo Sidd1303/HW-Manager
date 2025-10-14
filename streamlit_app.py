@@ -6,7 +6,7 @@ _sys.modules["sqlite3"] = _sys.modules.pop("pysqlite3")
 import streamlit as st
 
 # Import homework pages (each exposes render())
-from HWs import HW1, HW2, HW3, HW4, HW5
+from HWs import HW1, HW2, HW3, HW4, HW5, HW7
 
 st.sidebar.title("📚 Homework Selector")
 choice = st.sidebar.radio(
