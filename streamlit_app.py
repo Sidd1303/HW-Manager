@@ -16,7 +16,8 @@ choice = st.sidebar.radio(
         "HW2 – Multi-Provider Q&A",
         "HW3 – Chatbot with Memory",
         "HW4 – Orgs RAG Chatbot",
-        "HW5 – Orgs RAG Chatbot (Chat + Evaluation)",  # 👈 new
+        "HW5 – Orgs RAG Chatbot (Chat + Evaluation)",
+        "HW7 – News Info Bot",
     ],
 )
 
@@ -28,5 +29,7 @@ elif choice.startswith("HW3"):
     HW3.render()
 elif choice.startswith("HW4"):
     HW4.render()
-else:
+elif choice.startswith("HW5"):
     HW5.render()
+else:
+    HW7.render()
