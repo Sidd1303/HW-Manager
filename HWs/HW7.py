@@ -1,330 +1,332 @@
-# HWs/HW7.py
+# HW7 – News RAG Bot (ChromaDB + Local CSV)
+# - Reads only local news_data/news_dataset.csv
+# - Builds a persistent Chroma vectorstore
+# - "Most interesting news" ranking + "topic search"
+# - Chatbot answers only from embedded rows
+# - Absolute paths + robust vectorstore creation
+# - Works with OpenAI / Anthropic / Gemini (no streaming, minimal params)
+
+from __future__ import annotations
 
 import os
-import csv
+import shutil
+import time
+from datetime import datetime, timezone
 from collections import deque
-from typing import List, Dict, Tuple, Optional, Union
+from typing import List, Dict, Tuple
 
 import streamlit as st
+import pandas as pd
 
-# ---- Optional sqlite shim for Chroma on some Linux images ----
+# --- Optional fix for sqlite3 issues with Chroma on some hosts ---
 try:
     __import__("pysqlite3")  # noqa: F401
-    import sys
-    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+    import sys as _sys
+    _sys.modules["sqlite3"] = _sys.modules.pop("pysqlite3")
 except Exception:
     pass
 
-# Vector DB
 import chromadb
 from chromadb.utils import embedding_functions
 
-# LLM SDKs (no streaming, no temp/max_tokens unless required)
+# LLM SDKs (non-reasoning, no streaming)
 from openai import OpenAI as _OpenAI
 from anthropic import Anthropic as _Anthropic
 import google.generativeai as _genai
 
-# Robust datetime parsing
-from datetime import datetime, timezone
 
+# =========================================================
+# Paths & Environment
+# =========================================================
 
-# =========================
-# Globals / Constants
-# =========================
-CSV_PATH = "./news_data/news_dataset.csv"
-PERSIST_DIR = "./vectorstore/news"
-COLLECTION_NAME = "news_collection"
-
-# Provider → (Advanced, Lite) model names (non-reasoning)
-MODEL_MAP = {
-    "OpenAI": {
-        "Advanced": "gpt-4.1",
-        "Lite": "gpt-5-chat-latest",
-    },
-    "Anthropic": {
-        "Advanced": "claude-opus-4-1",
-        "Lite": "claude-3-5-haiku-latest",
-    },
-    "Google Gemini": {
-        "Advanced": "gemini-2.5-pro",
-        "Lite": "gemini-2.5-flash-lite",
-    },
-}
-
-
-# =========================
-# CSV Loader & Preprocessing
-# =========================
-
-def load_news_csv(path: str) -> List[Dict]:
+def _paths() -> Tuple[str, str, str]:
     """
-    Load news CSV and normalize keys.
-    We try multiple possible column names so your file is flexible.
-    Returns list of dict rows with:
-      - title (fallbacks tried)
-      - text (fallbacks tried)
-      - date/published (if present)
-      - topic/section/category (if present)
-      - url/source (if present)
-      - full_text = title + " - " + text
+    Resolve absolute paths, create folders, and return:
+      (project_root, csv_path, persist_dir)
     """
-    if not os.path.exists(path):
-        st.error(f"❌ CSV not found at {path}. Place your file at this path.")
-        return []
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    csv_path = os.path.join(root, "news_data", "news_dataset.csv")
+    persist_dir = os.path.join(root, "vectorstore", "news")
 
-    rows: List[Dict] = []
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        reader = csv.DictReader(f)
-        for raw in reader:
-            r = {k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in raw.items()}
-
-            # Title candidates
-            title = (
-                r.get("title") or
-                r.get("headline") or
-                r.get("article_title") or
-                r.get("Title") or
-                ""
-            )
-
-            # Text/content candidates
-            text = (
-                r.get("text") or
-                r.get("content") or
-                r.get("body") or
-                r.get("article") or
-                r.get("story") or
-                r.get("summary") or
-                r.get("Text") or
-                ""
-            )
-
-            # Date candidates
-            date_val = r.get("date") or r.get("published") or r.get("publish_date") or r.get("Date")
-
-            # Topic/Category candidates
-            topic = r.get("topic") or r.get("category") or r.get("section")
-
-            # Optional helpful info
-            url = r.get("url") or r.get("link")
-            source = r.get("source") or r.get("publisher")
-
-            full_text = f"{title} - {text}".strip(" -")
-
-            # Keep if we have some usable text
-            if title or text:
-                rows.append(
-                    {
-                        "title": title,
-                        "text": text,
-                        "date": date_val,
-                        "topic": topic,
-                        "url": url,
-                        "source": source,
-                        "full_text": full_text,
-                    }
-                )
-
-    if not rows:
-        st.error("❌ Could not load any rows from the CSV (no usable title/text).")
-    return rows
-
-
-# =========================
-# Date Parsing & Scoring
-# =========================
-
-def _parse_datetime(val: Union[str, datetime, None]) -> Optional[datetime]:
-    """Best-effort parsing of a date/time value into a timezone-aware UTC datetime."""
-    if val is None:
-        return None
-
-    if isinstance(val, datetime):
-        dt = val
-    else:
-        s = str(val).strip()
-        for fmt in (
-            "%Y-%m-%d",
-            "%Y-%m-%d %H:%M:%S",
-            "%Y/%m/%d",
-            "%Y/%m/%d %H:%M:%S",
-            "%d-%m-%Y",
-            "%d/%m/%Y",
-            "%m/%d/%Y",
-            "%m/%d/%Y %H:%M:%S",
-            "%Y-%m-%dT%H:%M:%S",
-            "%Y-%m-%dT%H:%M:%S.%f",
-            "%Y-%m-%dT%H:%M:%S%z",
-            "%Y-%m-%dT%H:%M:%S.%f%z",
-        ):
-            try:
-                dt = datetime.strptime(s, fmt)
-                break
-            except Exception:
-                dt = None
-        if dt is None:
-            try:
-                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-            except Exception:
-                return None
-
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-    return dt
-
-
-def recency_score(dt_val: Union[str, datetime, None]) -> float:
-    """
-    Higher for more recent dates.
-    Returns 0.3 baseline if no usable date (so recency contributes modestly).
-    """
-    dt = _parse_datetime(dt_val)
-    if dt is None:
-        return 0.3
-
-    now = datetime.now(timezone.utc)
-    if dt > now:
-        dt = now
-
-    days = max(1, (now - dt).days)
-    return 1.0 / (1.0 + (days / 7.0))  # smooth weekly decay
-
-
-# =========================
-# Interestingness Ranking
-# =========================
-
-def interestingness(row: Dict) -> float:
-    """
-    Heuristic ranking for 'most interesting' news for a global law firm.
-    Blend of:
-      - recency (50%)
-      - legal/financial cues in title (30%)
-      - length/coverage proxy (20%)
-    """
-    title = (row.get("title") or "").lower()
-    text = row.get("text") or ""
-    s_rec = recency_score(row.get("date"))
-    legal_cues = (
-        "lawsuit", "sues", "sued", "settlement", "regulator", "compliance",
-        "sanction", "fine", "acquires", "acquisition", "merger", "m&a",
-        "investigation", "antitrust", "fraud", "subpoena", "deal", "IPO",
-        "GDPR", "privacy", "patent", "trademark"
-    )
-    s_title = 1.0 if any(k in title for k in legal_cues) else 0.6
-    s_len = min(len(text) / 1500.0, 1.0)
-
-    score = 0.5 * s_rec + 0.3 * s_title + 0.2 * s_len
-    return float(score)
-
-
-# =========================
-# Chroma Vector Store
-# =========================
-
-def build_or_load_collection(
-    items: List[Dict],
-    persist_dir: str,
-    openai_key: str,
-    collection_name: str = COLLECTION_NAME,
-) -> chromadb.api.models.Collection.Collection:
-    """
-    Create/load persistent Chroma collection from CSV rows.
-    Each row becomes one document with metadata we can show as provenance.
-    """
+    os.makedirs(os.path.join(root, "vectorstore"), exist_ok=True)
     os.makedirs(persist_dir, exist_ok=True)
 
-    # write check (avoid "readonly database")
-    try:
-        testfile = os.path.join(persist_dir, ".writecheck")
-        with open(testfile, "w") as w:
-            w.write("ok")
-        os.remove(testfile)
-    except Exception as e:
-        st.warning(f"⚠️ Persist dir not writable ({persist_dir}): {e}. Using in-memory DB.")
-        client = chromadb.Client()
-    else:
-        client = chromadb.PersistentClient(path=persist_dir)
+    return root, csv_path, persist_dir
 
-    collection = client.get_or_create_collection(
-        name=collection_name,
-        embedding_function=embedding_functions.OpenAIEmbeddingFunction(
-            api_key=openai_key,
-            model_name="text-embedding-3-small",
-        ),
-    )
 
-    # Already embedded?
+# =========================================================
+# CSV Loading & Preprocessing
+# =========================================================
+
+TEXT_COL_CANDIDATES = ["headline", "title", "summary", "description", "content", "body", "text"]
+DATE_COL_CANDIDATES = ["date", "published", "published_at", "pub_date"]
+TOPIC_COL_CANDIDATES = ["topic", "category", "section", "tags", "keywords"]
+SOURCE_COL_CANDIDATES = ["source", "publisher", "outlet", "domain"]
+
+
+def _pick_col(cols: List[str], candidates: List[str]) -> str | None:
+    cols_lower = {c.lower(): c for c in cols}
+    for cand in candidates:
+        if cand in cols_lower:
+            return cols_lower[cand]
+    return None
+
+
+def _load_news_csv(csv_path: str) -> pd.DataFrame:
+    if not os.path.exists(csv_path):
+        st.error(f"❌ news_dataset.csv not found at:\n{csv_path}")
+        return pd.DataFrame()
+
+    df = pd.read_csv(csv_path)
+
+    # Try to locate useful columns (best-effort)
+    text_cols = [c for c in df.columns if str(df[c].dtype) == "object"]
+    date_col = _pick_col(df.columns.tolist(), DATE_COL_CANDIDATES)
+    topic_col = _pick_col(df.columns.tolist(), TOPIC_COL_CANDIDATES)
+    title_col = _pick_col(df.columns.tolist(), ["headline", "title"]) or (text_cols[0] if text_cols else None)
+    source_col = _pick_col(df.columns.tolist(), SOURCE_COL_CANDIDATES)
+
+    df._meta = {
+        "text_cols": text_cols,
+        "date_col": date_col,
+        "topic_col": topic_col,
+        "title_col": title_col,
+        "source_col": source_col,
+    }
+    return df
+
+
+def _row_as_text(row: pd.Series, meta: Dict[str, str]) -> str:
+    """
+    Build an embedding text string from a row.
+    We concatenate known textual columns; include date/topic/source if present.
+    """
+    parts = []
+
+    # Preferred fields first
+    title = str(row.get(meta.get("title_col", ""), "") or "").strip()
+    if title:
+        parts.append(f"Title: {title}")
+
+    topic_col = meta.get("topic_col")
+    if topic_col:
+        t = str(row.get(topic_col, "") or "").strip()
+        if t:
+            parts.append(f"Topic: {t}")
+
+    # Add more text columns
+    for c in meta.get("text_cols", []):
+        val = str(row.get(c, "") or "").strip()
+        if val and (c.lower() not in ["title", "headline"]):  # avoid repeating
+            parts.append(f"{c}: {val}")
+
+    # Add date/source if available
+    date_col = meta.get("date_col")
+    if date_col:
+        d = str(row.get(date_col, "") or "").strip()
+        if d:
+            parts.append(f"Date: {d}")
+
+    source_col = meta.get("source_col")
+    if source_col:
+        s = str(row.get(source_col, "") or "").strip()
+        if s:
+            parts.append(f"Source: {s}")
+
+    txt = " | ".join(parts)
+    return txt
+
+
+# =========================================================
+# Interestingness Scoring (heuristic for a global law firm)
+# =========================================================
+
+LAW_KEYWORDS = {
+    "regulatory": 1.0,
+    "regulation": 1.0,
+    "lawsuit": 1.2,
+    "litigation": 1.2,
+    "acquisition": 1.0,
+    "merger": 1.0,
+    "antitrust": 1.2,
+    "compliance": 0.9,
+    "settlement": 1.1,
+    "investigation": 1.0,
+    "ipo": 1.0,
+    "sanction": 1.1,
+    "privacy": 0.9,
+    "cybersecurity": 0.9,
+    "governance": 0.8,
+    "bankruptcy": 1.1,
+}
+
+BIG_NAMES = [
+    "microsoft", "google", "alphabet", "amazon", "apple", "meta",
+    "openai", "anthropic", "morgan stanley", "jpmorgan", "jp morgan",
+    "goldman sachs", "bank of america", "citi", "citigroup",
+    "tesla", "nvidia", "intel", "amd", "oracle", "salesforce",
+]
+
+
+def _parse_date_safe(date_str: str) -> datetime | None:
+    if not date_str or not isinstance(date_str, str):
+        return None
+    # Try pandas robust parser
     try:
-        existing = collection.count()
+        dt = pd.to_datetime(date_str, errors="coerce", utc=True)
+        if pd.isna(dt):
+            return None
+        # return naive UTC datetime (to compare with datetime.utcnow())
+        return dt.to_pydatetime().astimezone(timezone.utc).replace(tzinfo=None)
     except Exception:
-        existing = len(collection.get().get("ids", []))
+        return None
 
-    if existing and existing > 0:
-        return collection
 
-    # Build from items
-    docs, ids, metas = [], [], []
-    for i, row in enumerate(items):
-        text = row.get("full_text", "")
-        if not text:
-            continue
-        docs.append(text)
-        ids.append(f"row_{i}")
-        metas.append(
-            {
-                "title": row.get("title"),
-                "date": row.get("date"),
-                "topic": row.get("topic"),
-                "url": row.get("url"),
-                "source": row.get("source"),
-                "row_index": i,
-            }
-        )
+def recency_score(date_str: str, now: datetime | None = None) -> float:
+    """Newer = higher score. Safe with/without tz."""
+    now = now or datetime.utcnow()
+    dt = _parse_date_safe(date_str)
+    if not dt:
+        return 0.3  # unknown date gets a small baseline
+    # days difference
+    days = max(1, (now - dt).days)
+    # Exponential decay: 1.0 -> recent; ~0.1 after ~45 days
+    return max(0.05, min(1.0, 1.2 ** (-days / 14)))
+
+
+def legal_relevance(text: str) -> float:
+    t = (text or "").lower()
+    score = 0.0
+    for k, w in LAW_KEYWORDS.items():
+        if k in t:
+            score += w
+    for name in BIG_NAMES:
+        if name in t:
+            score += 0.3
+    # normalize (roughly)
+    return min(2.0, 0.3 + score)
+
+
+def interestingness(row: pd.Series, meta: Dict[str, str]) -> float:
+    """
+    Overall interestingness for a global law firm audience:
+      50% recency + 40% legal/business relevance + 10% length
+    """
+    # collect text for relevance
+    text = _row_as_text(row, meta)
+
+    # recency
+    dcol = meta.get("date_col")
+    dval = str(row.get(dcol, "") or "") if dcol else ""
+    s_rec = recency_score(dval)
+
+    # legal/business relevance
+    s_rel = legal_relevance(text)
+
+    # crude length score (longer summaries get a small boost)
+    length = max(30, len(text))
+    s_len = min(1.0, length / 800.0)
+
+    final = 0.5 * s_rec + 0.4 * (s_rel / 2.0) + 0.1 * s_len
+    return float(final)
+
+
+# =========================================================
+# Chroma – Build/Load persistent vector DB
+# =========================================================
+
+def _fresh_persist_dir(base_dir: str) -> str:
+    """Create a fresh subfolder if the DB becomes read-only/corrupt."""
+    new_dir = os.path.join(os.path.dirname(base_dir), f"news_v{int(time.time())}")
+    os.makedirs(new_dir, exist_ok=True)
+    return new_dir
+
+
+def _ensure_vector_db_from_csv(openai_key: str) -> Tuple[chromadb.Collection | None, str, pd.DataFrame]:
+    root, csv_path, persist_dir = _paths()
+
+    st.sidebar.caption("**HW7 Paths**")
+    st.sidebar.code(f"CSV:        {csv_path}")
+    st.sidebar.code(f"Vectorstore:{persist_dir}")
+
+    df = _load_news_csv(csv_path)
+    if df.empty:
+        return None, "", df
+
+    meta = df._meta
+    docs, metas, ids = [], [], []
+
+    for i, row in df.iterrows():
+        txt = _row_as_text(row, meta)
+        if txt:
+            docs.append(txt)
+            metas.append({
+                "row": int(i),
+                "date": str(row.get(meta.get("date_col", ""), "") or ""),
+                "title": str(row.get(meta.get("title_col", ""), "") or ""),
+                "topic": str(row.get(meta.get("topic_col", ""), "") or ""),
+                "source": str(row.get(meta.get("source_col", ""), "") or ""),
+            })
+            ids.append(f"row_{i}")
 
     if not docs:
         st.error("❌ No usable text found in the CSV rows.")
-        return collection
+        return None, "", df
 
-    collection.add(documents=docs, ids=ids, metadatas=metas)
-    st.sidebar.success(f"✅ Embedded {len(docs)} documents from CSV into Chroma.")
-    return collection
+    def build_client(path_dir: str) -> chromadb.PersistentClient:
+        return chromadb.PersistentClient(path=path_dir)
+
+    # Try to create/load collection. If read-only error -> rotate folder once.
+    for attempt in range(2):
+        path_try = persist_dir if attempt == 0 else _fresh_persist_dir(persist_dir)
+
+        try:
+            client = build_client(path_try)
+            collection = client.get_or_create_collection(
+                name="news_collection",
+                embedding_function=embedding_functions.OpenAIEmbeddingFunction(
+                    api_key=openai_key,
+                    model_name="text-embedding-3-small",
+                ),
+            )
+
+            try:
+                existing = collection.count()
+            except Exception:
+                existing = len(collection.get().get("ids", []))
+
+            if existing and existing > 0:
+                st.sidebar.success(f"🔁 Vector DB ready at {path_try} with {existing} items.")
+                return collection, path_try, df
+
+            # Add fresh
+            collection.add(documents=docs, metadatas=metas, ids=ids)
+            st.sidebar.success(f"✅ Embedded {len(docs)} rows into {path_try}.")
+            return collection, path_try, df
+
+        except Exception as e:
+            if attempt == 0:
+                st.sidebar.warning(f"Vector DB path '{persist_dir}' failed ({e}). Rotating once…")
+                continue
+            st.error(f"❌ Could not create vector DB: {e}")
+            return None, "", df
+
+    return None, "", df
 
 
-def retrieve_similar(
-    collection: chromadb.api.models.Collection.Collection,
-    query: str,
-    k: int = 5,
-) -> Tuple[List[Dict], List[int]]:
-    """
-    Query Chroma and return matched rows and row indices.
-    """
+def _retrieve(collection: chromadb.Collection, query: str, k: int = 6) -> Tuple[str, List[Dict]]:
     res = collection.query(query_texts=[query], n_results=k)
     docs = res.get("documents", [[]])[0]
     metas = res.get("metadatas", [[]])[0]
-
-    out_rows, row_indices = [], []
-    for m in metas:
-        # Reconstruct a row-ish dict from metadata (best effort)
-        r = {
-            "title": m.get("title"),
-            "date": m.get("date"),
-            "topic": m.get("topic"),
-            "url": m.get("url"),
-            "source": m.get("source"),
-        }
-        out_rows.append(r)
-        row_indices.append(m.get("row_index"))
-    return out_rows, row_indices
+    context = "\n\n".join([d for d in docs if d and d.strip()])
+    return context, metas
 
 
-# =========================
-# LLM Runners (no streaming)
-# =========================
+# =========================================================
+# LLM Runners (no streaming; minimal params)
+# =========================================================
 
-def run_openai(model: str, api_key: str, prompt: str) -> str:
+def _run_openai(model: str, api_key: str, prompt: str) -> str:
     client = _OpenAI(api_key=api_key)
     resp = client.chat.completions.create(
         model=model,
@@ -333,11 +335,11 @@ def run_openai(model: str, api_key: str, prompt: str) -> str:
     return (resp.choices[0].message.content or "").strip()
 
 
-def run_anthropic(model: str, api_key: str, prompt: str) -> str:
+def _run_anthropic(model: str, api_key: str, prompt: str) -> str:
     client = _Anthropic(api_key=api_key)
     resp = client.messages.create(
         model=model,
-        max_tokens=800,
+        max_tokens=900,
         messages=[{"role": "user", "content": prompt}],
     )
     try:
@@ -346,18 +348,18 @@ def run_anthropic(model: str, api_key: str, prompt: str) -> str:
         return ""
 
 
-def run_gemini(model: str, api_key: str, prompt: str) -> str:
+def _run_gemini(model: str, api_key: str, prompt: str) -> str:
     _genai.configure(api_key=api_key)
     g = _genai.GenerativeModel(model)
     r = g.generate_content(prompt)
     return (getattr(r, "text", "") or "").strip()
 
 
-# =========================
-# Prompt Builders
-# =========================
+# =========================================================
+# Prompts & Memory
+# =========================================================
 
-def serialize_memory(history: List[Dict], max_pairs: int = 5) -> str:
+def _memory_text(history: List[Dict], max_pairs: int = 5) -> str:
     dq = deque(history, maxlen=max_pairs * 2)
     lines = []
     for msg in dq:
@@ -366,243 +368,253 @@ def serialize_memory(history: List[Dict], max_pairs: int = 5) -> str:
     return "\n".join(lines)
 
 
-def build_rag_prompt(memory_txt: str, context: str, question: str) -> str:
+def _build_chat_prompt(memory_txt: str, context: str, question: str) -> str:
     return (
-        "You are a News Assistant for a global law firm. Use ONLY the provided 'Context' "
-        "(retrieved from the local news dataset). "
-        "If the answer is not in the context, respond exactly with: "
-        "\"I could not find this in the news dataset.\"\n\n"
+        "You are a news assistant for a global law firm. Use ONLY the provided 'Context' "
+        "(retrieved from the internal news dataset). If the answer is not in the context, "
+        "respond exactly with: \"I could not find this in the news dataset.\"\n\n"
         f"Conversation (last 5 Q/A):\n{memory_txt}\n\n"
         f"Context:\n{context}\n\n"
         f"Question: {question}\n"
-        "Answer:"
+        "Answer in 3-6 concise sentences with a lawyerly tone."
     )
 
 
-# =========================
-# Page UI
-# =========================
+def _build_list_prompt(context: str, task: str) -> str:
+    """
+    Format a prompt that asks the model to produce a structured list from retrieved items.
+    """
+    return (
+        "You are a news analyst for a global law firm. Use ONLY the 'Context' items below. "
+        "Return a structured list with bullets. For each item, extract Title, Date, Source, and a 1-2 sentence rationale. "
+        "If insufficient context, reply: \"I could not find this in the news dataset.\"\n\n"
+        f"Task: {task}\n\n"
+        f"Context:\n{context}\n\n"
+        "Output format:\n"
+        "- Title — Date — Source: Rationale…\n"
+        "- …"
+    )
+
+
+# =========================================================
+# App (Streamlit)
+# =========================================================
 
 def render():
-    st.header("HW7 – News RAG Bot (ChromaDB, CSV-embedded)")
+    st.header("HW7 – News Reporting Bot (RAG on Local CSV + Chroma)")
+    st.caption(
+        "Builds a persistent vector index from local news_data/news_dataset.csv only. "
+        "Answers: (1) most interesting news, (2) topic-specific news, (3) general Q&A chatbot."
+    )
 
-    # Secrets
-    OPENAI_KEY = st.secrets.get("OPENAI_API_KEY")
-    ANTHROPIC_KEY = st.secrets.get("ANTHROPIC_API_KEY")
-    GEMINI_KEY = st.secrets.get("GEMINI_API_KEY")
-
-    if not OPENAI_KEY:
-        st.error("Missing OPENAI_API_KEY in .streamlit/secrets.toml")
-        return
-    if not ANTHROPIC_KEY:
-        st.warning("ANTHROPIC_API_KEY not set; Anthropic option will fail.")
-    if not GEMINI_KEY:
-        st.warning("GEMINI_API_KEY not set; Gemini option will fail.")
-
-    # Sidebar
-    st.sidebar.header("⚙️ Settings")
-    provider = st.sidebar.selectbox("Provider", ["OpenAI", "Anthropic", "Google Gemini"])
-    mode = st.sidebar.radio("Mode", ["Most Interesting", "Topic Search", "Chatbot", "Evaluation"], horizontal=False)
-    tier_choice = st.sidebar.radio("Model Tier", ["Advanced", "Lite"], horizontal=True)
-    force_rebuild = st.sidebar.checkbox("Force rebuild vector DB", value=False)
-
-    adv_model = MODEL_MAP[provider]["Advanced"]
-    lite_model = MODEL_MAP[provider]["Lite"]
-    st.sidebar.caption(f"Advanced: `{adv_model}` · Lite: `{lite_model}`")
-
-    # Load CSV
-    rows = load_news_csv(CSV_PATH)
-    if not rows:
+    # API keys from secrets (only required for embeddings + optional generation)
+    KEYS = {
+        "OPENAI_API_KEY": st.secrets.get("OPENAI_API_KEY"),
+        "ANTHROPIC_API_KEY": st.secrets.get("ANTHROPIC_API_KEY"),
+        "GEMINI_API_KEY": st.secrets.get("GEMINI_API_KEY"),
+    }
+    if not KEYS["OPENAI_API_KEY"]:
+        st.error("Missing OPENAI_API_KEY in .streamlit/secrets.toml (needed for embeddings).")
         return
 
-    # Build / Load Chroma
-    if force_rebuild and os.path.exists(PERSIST_DIR):
-        try:
-            import shutil
-            shutil.rmtree(PERSIST_DIR)
-            st.sidebar.info("🧹 Deleted existing vector DB; rebuilding…")
-        except Exception as e:
-            st.sidebar.warning(f"Could not delete vector DB: {e}")
+    # Provider selection (for generation; embeddings always use OpenAI text-embedding-3-small)
+    st.sidebar.header("⚙️ Provider & Models")
+    provider = st.sidebar.selectbox("Generator Vendor", ["OpenAI", "Anthropic", "Google Gemini"])
+    tier = st.sidebar.radio("Model Tier", ["Advanced", "Lite"], horizontal=True)
 
-    collection = build_or_load_collection(items=rows, persist_dir=PERSIST_DIR, openai_key=OPENAI_KEY)
-    if not collection:
+    model_map = {
+        "OpenAI": {"Advanced": "gpt-4.1", "Lite": "gpt-5-chat-latest"},
+        "Anthropic": {"Advanced": "claude-opus-4-1", "Lite": "claude-3-5-haiku-latest"},
+        "Google Gemini": {"Advanced": "gemini-2.5-pro", "Lite": "gemini-2.5-flash-lite"},
+    }
+    model_name = model_map[provider][tier]
+    st.sidebar.write(f"**Using model:** {model_name}")
+
+    # Build/load vector DB from local CSV
+    collection, persist_dir, df = _ensure_vector_db_from_csv(KEYS["OPENAI_API_KEY"])
+    if collection is None or df.empty:
         return
 
-    # Debug panel (helpful for provenance & sanity)
-    with st.expander("🔍 Debug / Provenance"):
-        try:
-            cnt = collection.count()
-        except Exception:
-            cnt = "?"
-        st.write(f"Embeddings in collection: **{cnt}**")
-        st.write({"csv_path": CSV_PATH, "persist_dir": PERSIST_DIR, "collection": COLLECTION_NAME})
+    # Tabs: Most Interesting, Topic Search, Chatbot, Evaluation
+    tab1, tab2, tab3, tab4 = st.tabs(["🔥 Most Interesting", "🔎 Topic Search", "💬 Chatbot", "📊 Evaluation"])
 
-    # Helper for model run
-    def _call_llm(model_name: str, prompt: str) -> str:
-        if provider == "OpenAI":
-            return run_openai(model_name, OPENAI_KEY, prompt)
-        elif provider == "Anthropic":
-            return run_anthropic(model_name, ANTHROPIC_KEY, prompt)
-        else:
-            return run_gemini(model_name, GEMINI_KEY, prompt)
+    # -------------------- Most Interesting --------------------
+    with tab1:
+        st.subheader("Find the Most Interesting News (Law-Firm Heuristic Ranking)")
+        st.write("Ranks all rows using recency + legal/business relevance heuristics.")
 
-    # ======== Mode: Most Interesting ========
-    if mode == "Most Interesting":
-        st.subheader("📈 Most Interesting News (Ranked for a global law firm)")
-        n_show = st.number_input("How many items?", min_value=5, max_value=50, value=10, step=1)
+        # Compute scores
+        meta = df._meta
+        scores = []
+        for i, row in df.iterrows():
+            s = interestingness(row, meta)
+            scores.append((float(s), int(i)))
+        scores.sort(reverse=True)
 
-        # Rank all rows
-        scored = []
-        for r in rows:
-            s = interestingness(r)
-            scored.append((s, r))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        top = scored[:n_show]
+        top_k = st.slider("How many items?", 5, 30, 10, step=1)
+        top_rows = scores[:top_k]
 
-        for idx, (score, r) in enumerate(top, 1):
-            title = r.get("title") or "(no title)"
-            date_val = r.get("date") or "(no date)"
-            source = r.get("source") or "(no source)"
-            url = r.get("url")
-            st.markdown(f"**{idx}. {title}**  \nScore: `{score:.3f}` · Date: `{date_val}` · Source: `{source}`")
-            if url:
-                st.write(url)
-            st.divider()
+        # Build a "context" to pass to the model for a neat bullet list
+        ctx_parts = []
+        for s, idx in top_rows:
+            r = df.iloc[idx]
+            title = str(r.get(meta.get("title_col", ""), "") or "").strip()
+            date = str(r.get(meta.get("date_col", ""), "") or "").strip()
+            src = str(r.get(meta.get("source_col", ""), "") or "").strip()
+            topic = str(r.get(meta.get("topic_col", ""), "") or "").strip()
+            txt = _row_as_text(r, meta)
+            ctx_parts.append(f"[Score={s:.2f}] Title: {title} | Date: {date} | Source: {src} | Topic: {topic} | {txt}")
 
-        st.caption("Heuristic = 50% recency, 30% legal/finance cues in title, 20% article length proxy.")
+        context = "\n".join(ctx_parts)
+        prompt = _build_list_prompt(context, "Produce a ranked list from the supplied items, highest score first.")
 
-    # ======== Mode: Topic Search ========
-    elif mode == "Topic Search":
-        st.subheader("🔎 Find news about a specific topic")
-        topic_q = st.text_input("Your topic (e.g., 'JP Morgan opening smaller branches')")
-        k = st.slider("Top-k results", min_value=3, max_value=10, value=5)
-        if topic_q:
-            hits, idxs = retrieve_similar(collection, topic_q, k=k)
-            if not hits:
-                st.write("I could not find this in the news dataset.")
+        if st.button("Generate Ranked Summary"):
+            if provider == "OpenAI":
+                out = _run_openai(model_name, KEYS["OPENAI_API_KEY"], prompt)
+            elif provider == "Anthropic":
+                out = _run_anthropic(model_name, KEYS["ANTHROPIC_API_KEY"], prompt)
             else:
-                for i, h in enumerate(hits, 1):
-                    title = h.get("title") or "(no title)"
-                    date_val = h.get("date") or "(no date)"
-                    source = h.get("source") or "(no source)"
-                    url = h.get("url")
-                    st.markdown(f"**{i}. {title}**  \nDate: `{date_val}` · Source: `{source}`")
-                    if url:
-                        st.write(url)
-                    st.divider()
+                out = _run_gemini(model_name, KEYS["GEMINI_API_KEY"], prompt)
+            st.markdown(out if out else "I could not find this in the news dataset.")
 
-    # ======== Mode: Chatbot ========
-    elif mode == "Chatbot":
-        st.subheader("💬 News Chatbot (RAG)")
-        model_name = adv_model if tier_choice == "Advanced" else lite_model
+        with st.expander("Show Top Items (raw)"):
+            for s, idx in top_rows:
+                r = df.iloc[idx]
+                title = str(r.get(meta.get("title_col", ""), "") or "").strip()
+                date = str(r.get(meta.get("date_col", ""), "") or "").strip()
+                src = str(r.get(meta.get("source_col", ""), "") or "").strip()
+                st.write(f"- **{title}** — {date} — {src} (score {s:.2f})")
 
-        chat_key = f"{provider}:{tier_choice}"
+    # -------------------- Topic Search --------------------
+    with tab2:
+        st.subheader("Find News About a Topic")
+        topic_q = st.text_input("Topic (e.g., 'antitrust', 'JP Morgan branch', 'IPO')", "")
+
+        if topic_q:
+            context, metas = _retrieve(collection, topic_q, k=12)
+
+            # Ask LLM to pick and present best matches from the retrieved context
+            task = f"From the context items, find news about: '{topic_q}'. Return a curated list."
+            prompt = _build_list_prompt(context, task)
+
+            if provider == "OpenAI":
+                out = _run_openai(model_name, KEYS["OPENAI_API_KEY"], prompt)
+            elif provider == "Anthropic":
+                out = _run_anthropic(model_name, KEYS["ANTHROPIC_API_KEY"], prompt)
+            else:
+                out = _run_gemini(model_name, KEYS["GEMINI_API_KEY"], prompt)
+
+            st.markdown(out if out else "I could not find this in the news dataset.")
+
+            with st.expander("📂 Sources used (retrieved)"):
+                for m in metas:
+                    title = m.get("title", "")
+                    date = m.get("date", "")
+                    src = m.get("source", "")
+                    st.write(f"- {title} — {date} — {src}")
+
+    # -------------------- Chatbot --------------------
+    with tab3:
+        st.subheader("Chatbot (Answers Only from Embedded CSV)")
+        # Keep history separate per model
+        chat_key = f"{provider}:{tier}"
         if "hw7_chat_key" not in st.session_state or st.session_state.hw7_chat_key != chat_key:
             st.session_state.hw7_chat_key = chat_key
             st.session_state.hw7_chat = []
-            st.sidebar.info(f"🔄 Chat reset for {chat_key}")
 
-        # Show history
+        # show history
         for m in st.session_state.hw7_chat:
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
 
-        user_q = st.chat_input("Ask about the news in the dataset…")
+        user_q = st.chat_input("Ask a question about the news…")
         if user_q:
             st.session_state.hw7_chat.append({"role": "user", "content": user_q})
             with st.chat_message("user"):
                 st.markdown(user_q)
 
-            # Retrieve context from Chroma
-            res = collection.query(query_texts=[user_q], n_results=5)
-            docs = res.get("documents", [[]])[0]
-            metas = res.get("metadatas", [[]])[0]
-            context = "\n\n".join(d for d in docs if d and d.strip())
-            sources = [
-                {"title": m.get("title"), "date": m.get("date"), "source": m.get("source"), "url": m.get("url")}
-                for m in metas
-            ]
+            # Retrieve & answer
+            context, metas = _retrieve(collection, user_q, k=10)
+            mem = _memory_text(st.session_state.hw7_chat, max_pairs=5)
+            prompt = _build_chat_prompt(mem, context, user_q)
 
-            memory_txt = serialize_memory(st.session_state.hw7_chat, max_pairs=5)
-            prompt = build_rag_prompt(memory_txt, context, user_q)
+            if provider == "OpenAI":
+                ans = _run_openai(model_name, KEYS["OPENAI_API_KEY"], prompt)
+            elif provider == "Anthropic":
+                ans = _run_anthropic(model_name, KEYS["ANTHROPIC_API_KEY"], prompt)
+            else:
+                ans = _run_gemini(model_name, KEYS["GEMINI_API_KEY"], prompt)
 
-            try:
-                ans = _call_llm(model_name, prompt)
-                if not ans:
-                    ans = "I could not find this in the news dataset."
-            except Exception as e:
-                ans = f"⚠️ {provider} / {model_name} failed: {e}"
+            if not ans:
+                ans = "I could not find this in the news dataset."
 
             with st.chat_message("assistant"):
                 st.markdown(ans)
             st.session_state.hw7_chat.append({"role": "assistant", "content": ans})
 
-            # Sources this turn
-            if sources:
-                with st.expander("📂 Sources used (this turn)"):
-                    for s in sources:
-                        title = s.get("title") or "(no title)"
-                        date_v = s.get("date") or "(no date)"
-                        source = s.get("source") or "(no source)"
-                        url = s.get("url")
-                        st.write(f"- {title} · {date_v} · {source}")
-                        if url:
-                            st.write(f"  {url}")
-
-            # Keep last 5 Q/A pairs (10 messages)
+            # trim to last 10 messages (5 Q&A)
             st.session_state.hw7_chat = st.session_state.hw7_chat[-10:]
 
-    # ======== Mode: Evaluation ========
-    else:
-        st.subheader("🧪 Evaluation: Advanced vs Lite (same provider)")
-        QUESTIONS = [
-            "Find the most interesting regulatory enforcement item.",
-            "Show recent M&A or acquisition-related stories.",
-            "Any lawsuits or investigations against a major bank?",
-            "Summarize a significant data privacy or GDPR story.",
-            "Are there notable fines or sanctions in the dataset?",
+            with st.expander("📂 Sources used (retrieved)"):
+                for m in metas:
+                    title = m.get("title", "")
+                    date = m.get("date", "")
+                    src = m.get("source", "")
+                    st.write(f"- {title} — {date} — {src}")
+
+    # -------------------- Evaluation (2 vendors, Adv vs Lite) --------------------
+    with tab4:
+        st.subheader("Evaluation (Compare Models)")
+        st.write("Pick a vendor below; we’ll run the same questions on Advanced vs Lite for that vendor.")
+        eval_vendor = st.selectbox("Vendor to compare", ["OpenAI", "Anthropic", "Google Gemini"], index=0)
+
+        eval_models = model_map[eval_vendor]
+        qset = [
+            "Find the most interesting news overall.",
+            "Find news about antitrust actions in tech.",
+            "Summarize IPO-related stories.",
+            "Find news involving major banks (e.g., JPMorgan).",
+            "What are the latest regulatory updates mentioned?",
         ]
-        st.write("This will query RAG context for each question and compare outputs.")
+
         if st.button("Run Evaluation"):
-            for i, q in enumerate(QUESTIONS, 1):
+            for i, q in enumerate(qset, 1):
                 st.markdown(f"### Q{i}. {q}")
+                # Retrieve once
+                context, metas = _retrieve(collection, q, k=12)
+                prompt = _build_list_prompt(context, f"Answer: {q}")
 
-                # retrieve once, ask both models with same context
-                res = collection.query(query_texts=[q], n_results=5)
-                docs = res.get("documents", [[]])[0]
-                metas = res.get("metadatas", [[]])[0]
-                context = "\n\n".join(d for d in docs if d and d.strip())
-                sources = [
-                    {"title": m.get("title"), "date": m.get("date"), "source": m.get("source"), "url": m.get("url")}
-                    for m in metas
-                ]
-                prompt = build_rag_prompt("", context, q)
-
+                # Advanced
                 try:
-                    adv_out = _call_llm(MODEL_MAP[provider]["Advanced"], prompt) or "I could not find this in the news dataset."
+                    if eval_vendor == "OpenAI":
+                        adv_out = _run_openai(eval_models["Advanced"], KEYS["OPENAI_API_KEY"], prompt)
+                    elif eval_vendor == "Anthropic":
+                        adv_out = _run_anthropic(eval_models["Advanced"], KEYS["ANTHROPIC_API_KEY"], prompt)
+                    else:
+                        adv_out = _run_gemini(eval_models["Advanced"], KEYS["GEMINI_API_KEY"], prompt)
                 except Exception as e:
                     adv_out = f"⚠️ Advanced failed: {e}"
 
+                # Lite
                 try:
-                    lite_out = _call_llm(MODEL_MAP[provider]["Lite"], prompt) or "I could not find this in the news dataset."
+                    if eval_vendor == "OpenAI":
+                        lite_out = _run_openai(eval_models["Lite"], KEYS["OPENAI_API_KEY"], prompt)
+                    elif eval_vendor == "Anthropic":
+                        lite_out = _run_anthropic(eval_models["Lite"], KEYS["ANTHROPIC_API_KEY"], prompt)
+                    else:
+                        lite_out = _run_gemini(eval_models["Lite"], KEYS["GEMINI_API_KEY"], prompt)
                 except Exception as e:
                     lite_out = f"⚠️ Lite failed: {e}"
 
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.markdown(f"**Advanced – {MODEL_MAP[provider]['Advanced']}**")
-                    st.write(adv_out)
+                    st.markdown(f"**Advanced – {eval_models['Advanced']}**")
+                    st.write(adv_out or "I could not find this in the news dataset.")
                 with c2:
-                    st.markdown(f"**Lite – {MODEL_MAP[provider]['Lite']}**")
-                    st.write(lite_out)
+                    st.markdown(f"**Lite – {eval_models['Lite']}**")
+                    st.write(lite_out or "I could not find this in the news dataset.")
 
-                with st.expander("📂 Sources"):
-                    for s in sources:
-                        title = s.get("title") or "(no title)"
-                        date_v = s.get("date") or "(no date)"
-                        source = s.get("source") or "(no source)"
-                        url = s.get("url")
-                        st.write(f"- {title} · {date_v} · {source}")
-                        if url:
-                            st.write(f"  {url}")
+                with st.expander("📂 Sources (retrieved)"):
+                    for m in metas:
+                        st.write(f"- {m.get('title','')} — {m.get('date','')} — {m.get('source','')}")
                 st.divider()
