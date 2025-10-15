@@ -31,8 +31,8 @@ from datetime import datetime, timezone
 # =========================
 # Globals / Constants
 # =========================
-CSV_PATH = "news_data/news_dataset.csv"
-PERSIST_DIR = "vectorstore/news"
+CSV_PATH = "/news_data/news_dataset.csv"
+PERSIST_DIR = "/vectorstore/news"
 COLLECTION_NAME = "news_collection"
 
 # Provider → (Advanced, Lite) model names (non-reasoning)
